@@ -5,11 +5,15 @@ import shutil
 import ctypes
 import stat
 import time
+import string
 import hashlib
 from datetime import datetime
 from send2trash import send2trash
 
-# รายชื่อโฟลเดอร์ระบบที่ต้องข้ามการสแกนเด็ดขาด
+# นำเข้าฟังก์ชันเฝ้าระวังไฟล์แบบ Real-time
+from watcher import start_watching
+
+# รายชื่อโฟลเดอร์ระบบที่ต้องข้ามการสแกนเด็ดขาดเพื่อความปลอดภัย
 SKIP_DIRECTORIES = {
     "c:\\windows",
     "c:\\program files",
@@ -28,7 +32,29 @@ def is_system_path(path):
             return True
     return False
 
-# นำเข้าไลบรารีอ่าน PDF (ใช้ pdfplumber หรือ pypdf)
+def get_all_available_drives():
+    """ตรวจหา Drive Letter ทั้งหมดที่เชื่อมต่อในเครื่อง (รวม External Drives และไดรฟ์ภายนอก)"""
+    drives = []
+    bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+    for letter in string.ascii_uppercase:
+        if bitmask & 1:
+            drive_path = f"{letter}:\\"
+            if os.path.exists(drive_path):
+                drives.append(drive_path)
+        bitmask >>= 1
+    return drives
+
+def get_onedrive_path():
+    """ค้นหาโฟลเดอร์ OneDrive ของผู้ใช้ในเครื่อง"""
+    user_profile = os.environ.get("USERPROFILE", "")
+    if user_profile:
+        for folder_name in ["OneDrive", "OneDrive - Personal"]:
+            possible_path = os.path.join(user_profile, folder_name)
+            if os.path.exists(possible_path):
+                return possible_path
+    return None
+
+# นำเข้าไลบรารีอ่าน PDF
 pdf_library = None
 try:
     import pdfplumber
@@ -115,7 +141,6 @@ class DeleteWorkerThread(QThread):
             self.progress_signal.emit(idx, path, True, "")
 
             try:
-                # ป้องกันการลบไฟล์ระบบชั้นสอง
                 if is_system_path(path):
                     failed_files.append((path, "ข้ามการลบเนื่องจากเป็นไฟล์ในโฟลเดอร์ระบบสำคัญ"))
                     continue
@@ -161,8 +186,10 @@ class DuplicateCleanerUI(QMainWindow):
         self.resize(1200, 750)
         
         self.target_folder = ""
+        self.scan_targets = []  # ลิสต์รองรับหลายพาธ (เพื่อรองรับการสแกนทุกไดรฟ์ + OneDrive พร้อมกัน)
         self.scanner_thread = None
         self.delete_thread = None
+        self.observer = None  # สถานะเฝ้าระวังไฟล์ Real-time
         self.history_file = "delete_history.json"
         self.backup_dir = os.path.abspath(".trash_backup")
         self.db = DatabaseManager()
@@ -235,7 +262,7 @@ class DuplicateCleanerUI(QMainWindow):
         self.ctrl_frame.setObjectName("ctrl_frame")
         ctrl_layout = QVBoxLayout(self.ctrl_frame)
 
-        self.lbl_path = QLabel("โฟลเดอร์: ยังไม่ได้เลือกโฟลเดอร์")
+        self.lbl_path = QLabel("ตำแหน่งที่เลือก: ยังไม่ได้เลือกตำแหน่งสแกน")
         self.lbl_path.setStyleSheet("font-size: 13px; font-weight: bold; margin-bottom: 5px;")
 
         btn_box = QHBoxLayout()
@@ -243,9 +270,9 @@ class DuplicateCleanerUI(QMainWindow):
         self.btn_select.setObjectName("btn_select")
         self.btn_select.clicked.connect(self.select_folder)
         
-        self.btn_scan_c = QPushButton("💻 สแกนทั้งเครื่อง")
+        self.btn_scan_c = QPushButton("🌐 สแกนทั้งระบบ (รวม External & OneDrive)")
         self.btn_scan_c.setObjectName("btn_scan_c")
-        self.btn_scan_c.clicked.connect(self.select_c_drive)
+        self.btn_scan_c.clicked.connect(self.select_all_drives_and_onedrive)
 
         self.btn_scan = QPushButton("🚀 เริ่มสแกนทันที")
         self.btn_scan.setObjectName("btn_scan")
@@ -300,7 +327,6 @@ class DuplicateCleanerUI(QMainWindow):
         self.tree.setHeaderLabels(["กลุ่ม", "เลือก / ชื่อไฟล์ / Path", "ขนาดไฟล์", "สถานะ / Hash"])
         self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
         self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        # ปรับความกว้างของคอลัมน์แรกเป็น 130 เพื่อไม่ให้คำว่า กลุ่มที่ 10, 11... ถูกตัดคำเป็น ...
         self.tree.setColumnWidth(0, 130)
         self.tree.setColumnWidth(2, 110)
         self.tree.setColumnWidth(3, 220)
@@ -628,29 +654,43 @@ class DuplicateCleanerUI(QMainWindow):
                 return
             
             self.target_folder = clean_folder
+            self.scan_targets = [clean_folder]
             self.lbl_path.setText(f"โฟลเดอร์: {self.target_folder}")
             self.btn_scan.setEnabled(True)
 
-    def select_c_drive(self):
-        c_path = os.path.abspath("C:\\")
-        if os.path.exists(c_path):
-            self.target_folder = c_path
-            self.lbl_path.setText(f"สแกนทั้งเครื่อง: {self.target_folder}")
-            self.btn_scan.setEnabled(True)
+    def select_all_drives_and_onedrive(self):
+        """เลือกสแกนทุกไดรฟ์ที่เสียบอยู่ในเครื่อง (รวม External Drives) และโฟลเดอร์ OneDrive"""
+        all_drives = get_all_available_drives()
+        onedrive_path = get_onedrive_path()
+
+        targets = list(all_drives)
+        label_parts = [f"ไดรฟ์ ({', '.join(all_drives)})"]
+
+        if onedrive_path and os.path.exists(onedrive_path):
+            if onedrive_path not in targets:
+                targets.append(onedrive_path)
+            label_parts.append("☁️ OneDrive")
+
+        self.scan_targets = targets
+        self.target_folder = targets[0] if targets else "C:\\"
+        
+        display_str = " + ".join(label_parts)
+        self.lbl_path.setText(f"สแกนทั้งระบบ: {display_str}")
+        self.btn_scan.setEnabled(True)
 
     def start_scan(self):
-        if not self.target_folder or not os.path.exists(self.target_folder):
-            QMessageBox.warning(self, "แจ้งเตือน", "กรุณาเลือกโฟลเดอร์ที่ถูกต้องก่อน")
+        if not self.scan_targets:
+            QMessageBox.warning(self, "แจ้งเตือน", "กรุณาเลือกโฟลเดอร์หรือสแกนทั้งระบบก่อน")
             return
 
-        if is_system_path(self.target_folder) and self.target_folder.lower() != "c:\\":
-            QMessageBox.warning(
-                self,
-                "⚠️ แจ้งเตือนโฟลเดอร์สำคัญ",
-                f"โฟลเดอร์นี้เป็นโฟลเดอร์ระบบ/โปรแกรมสำคัญ:\n\n'{self.target_folder}'\n\n"
-                "ระบบจะข้ามการสแกนเพื่อป้องกันความเสียหายต่อระบบปฏิบัติการ"
-            )
-            return
+        # ปิดระบบ Watcher เก่าชั่วคราวระหว่างทำการสแกนเต็มรูปแบบ เพื่อให้ความเร็วสูงสุด
+        if self.observer:
+            try:
+                self.observer.stop()
+                self.observer.join()
+                self.observer = None
+            except Exception:
+                pass
 
         self.tree.blockSignals(True)
         self.tree.clear()
@@ -722,7 +762,6 @@ class DuplicateCleanerUI(QMainWindow):
                     f"<i>🔍 (คลิกซ้ายที่รูป preview ด้านบนเพื่อขยายใหญ่)</i>"
                 )
 
-                # ตัวแปรเก็บ QPixmap สำหรับนำไปขยาย
                 current_pixmap = None
 
                 # 1. ไฟล์รูปภาพ
@@ -743,14 +782,14 @@ class DuplicateCleanerUI(QMainWindow):
                         self.lbl_preview_image.setText("🖼️ ไม่สามารถโหลดตัวอย่างภาพได้")
                         self.lbl_preview_info.setText(info_text)
 
-                # 2. ไฟล์ PDF (แปลงเป็นรูปภาพหน้าจริง)
+                # 2. ไฟล์ PDF
                 elif ext == '.pdf':
                     try:
-                        import fitz  # PyMuPDF
+                        import fitz
                         doc = fitz.open(clean_path)
                         if len(doc) > 0:
-                            page = doc[0]  # ดึงหน้าแรก
-                            pix = page.get_pixmap(dpi=200)  # เพิ่ม dpi เพื่อความคมชัดสูงขึ้นในการขยาย
+                            page = doc[0]
+                            pix = page.get_pixmap(dpi=200)
                             
                             img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
                             current_pixmap = QPixmap.fromImage(img)
@@ -771,7 +810,7 @@ class DuplicateCleanerUI(QMainWindow):
                         self.lbl_preview_image.setText(f"📕 ไม่สามารถแปลง PDF เป็นภาพได้:\n{str(e)}")
                         self.lbl_preview_info.setText(info_text)
 
-              # 3. ไฟล์ Word (.docx) -> อ่าน Text เนื้อหาพรีวิวอย่างมีเสถียรภาพ
+                # 3. ไฟล์ Word (.docx)
                 elif ext == '.docx':
                     if docx:
                         try:
@@ -788,7 +827,8 @@ class DuplicateCleanerUI(QMainWindow):
                         self.lbl_preview_image.setText("📘 ไม่พบโมดูล python-docx สำหรับอ่านเอกสาร")
                     
                     self.lbl_preview_info.setText(info_text.replace("🔍 (คลิกซ้ายที่รูป preview ด้านบนเพื่อขยายใหญ่)", ""))
-                # 4. ไฟล์ประเภทข้อความทั่วไป (Text/Code/CSV/Log)
+                
+                # 4. ไฟล์ข้อความทั่วไป
                 elif ext in ['.txt', '.csv', '.log', '.json', '.xml', '.py', '.md', '.html', '.ini', '.bat']:
                     try:
                         with open(clean_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -804,7 +844,6 @@ class DuplicateCleanerUI(QMainWindow):
                     self.lbl_preview_image.setText(f"📦 ไฟล์ประเภท {ext.upper()}\n(ไม่รองรับการแสดงตัวอย่างเนื้อหา)")
                     self.lbl_preview_info.setText(info_text.replace("🔍 (คลิกซ้ายที่รูป preview ด้านบนเพื่อขยายใหญ่)", ""))
 
-                # ผูกกิจกรรมคลิกรูปเพื่อเปิด Pop-up ขยายภาพ (เฉพาะเมื่อมีรูปภาพ/PDF)
                 if current_pixmap and not current_pixmap.isNull():
                     self.lbl_preview_image.setCursor(Qt.CursorShape.PointingHandCursor)
                     self.lbl_preview_image.mousePressEvent = lambda event: self.open_zoom_dialog(current_pixmap, os.path.basename(clean_path))
@@ -813,7 +852,6 @@ class DuplicateCleanerUI(QMainWindow):
                     self.lbl_preview_image.mousePressEvent = None
 
     def open_zoom_dialog(self, pixmap, filename):
-        """ฟังก์ชันเปิดหน้าต่างขยายภาพ"""
         dialog = ImageZoomDialog(pixmap, title=f"ตัวอย่างขยายใหญ่ - {filename}", parent=self)
         dialog.exec()
 
@@ -841,6 +879,13 @@ class DuplicateCleanerUI(QMainWindow):
 
         total_scanned = self.last_total_scanned
 
+        # สั่งเริ่มเปิดเฝ้าระวังไฟล์ Real-time "หลังจากสแกนเสร็จแล้วเท่านั้น"
+        try:
+            if self.target_folder and os.path.exists(self.target_folder):
+                self.observer = start_watching(self.target_folder)
+        except Exception as e:
+            print(f"ไม่สามารถเริ่ม Real-time File Watcher ได้: {e}")
+
         if not duplicates:
             self.lbl_card_status.setText("🎉 ไม่พบรายการซ้ำแล้ว!")
             self.lbl_status_line.setText("ไม่พบไฟล์ซ้ำในพื้นที่นี้")
@@ -861,18 +906,14 @@ class DuplicateCleanerUI(QMainWindow):
         self.progress_bar.setValue(100)
         self.btn_delete.setEnabled(True)
 
-        # ----------------------------------------------------------------------
-        # ตรรกะการเรียงลำดับกลุ่ม: ให้กลุ่มที่มีไฟล์ "เลือกลบได้" ขึ้นมาก่อนกลุ่มที่ถูกล็อคทั้งหมด
-        # ----------------------------------------------------------------------
         def group_has_deletable_files(item_tuple):
             hash_val, files = item_tuple
             for filepath, size in files:
                 is_protected, _ = self.is_protected_file(filepath)
                 if not is_protected:
-                    return True  # มีไฟล์ลบได้
-            return False  # ติดล็อคทั้งกลุ่ม
+                    return True
+            return False
 
-        # แยกเป็น 2 ลิสต์: ลิสต์ที่ลบได้ขึ้นก่อน ลิสต์ที่ลบไม่ได้ไว้ทีหลัง
         sorted_duplicates = sorted(
             duplicates.items(),
             key=lambda item: group_has_deletable_files(item),
@@ -1117,9 +1158,7 @@ class DuplicateCleanerUI(QMainWindow):
             if os.path.exists(self.backup_dir):
                 shutil.rmtree(self.backup_dir, ignore_errors=True)
 
-            # สั่ง Windows API ให้ทำการล้างไฟล์ออกจาก Recycle Bin อัตโนมัติหลังกู้คืนเสร็จ
             try:
-                # Flag 7 = SHERB_NOCONFIRMATION (1) | SHERB_NOPROGRESSUI (2) | SHERB_NOSOUND (4)
                 ctypes.windll.shell32.SHEmptyRecycleBinW(None, None, 7)
             except Exception:
                 pass
@@ -1139,6 +1178,14 @@ class DuplicateCleanerUI(QMainWindow):
             QMessageBox.critical(self, "ข้อผิดพลาด", f"เกิดปัญหาในการกู้คืนไฟล์: {str(e)}")
 
     def closeEvent(self, event):
+        """จัดการปิดเฝ้าระวังไฟล์และทำความสะอาดไฟล์ชั่วคราวก่อนปิดโปรแกรม"""
+        if self.observer:
+            try:
+                self.observer.stop()
+                self.observer.join()
+            except Exception:
+                pass
+
         if os.path.exists(self.checkmark_path):
             try:
                 os.remove(self.checkmark_path)
