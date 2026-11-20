@@ -6,7 +6,6 @@ import ctypes
 import stat
 import time
 import string
-import hashlib
 from datetime import datetime
 from send2trash import send2trash
 
@@ -72,9 +71,17 @@ try:
 except ImportError:
     docx = None
 
-from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QScrollArea
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QPixmap, QImage
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QFileDialog, QTreeWidget, QTreeWidgetItem,
+    QProgressBar, QMessageBox, QHeaderView, QFrame, QProgressDialog,
+    QDialog, QScrollArea
+)
+from PyQt6.QtCore import Qt, QPointF, QThread, pyqtSignal
+from PyQt6.QtGui import QPixmap, QPainter, QColor, QPen, QPainterPath, QImageReader, QImage
+from scanner import ScannerThread
+from db import DatabaseManager
+
 
 class ImageZoomDialog(QDialog):
     """หน้าต่าง Pop-up สำหรับขยายดูรูปภาพขนาดใหญ่"""
@@ -100,17 +107,6 @@ class ImageZoomDialog(QDialog):
         
         scroll_area.setWidget(lbl_image)
         layout.addWidget(scroll_area)
-
-
-from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QFileDialog, QTreeWidget, QTreeWidgetItem,
-    QProgressBar, QMessageBox, QHeaderView, QFrame, QProgressDialog
-)
-from PyQt6.QtCore import Qt, QPointF, QThread, pyqtSignal
-from PyQt6.QtGui import QPixmap, QPainter, QColor, QPen, QPainterPath, QImageReader
-from scanner import ScannerThread
-from db import DatabaseManager
 
 
 # ==========================================
@@ -183,19 +179,21 @@ class DuplicateCleanerUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Ultra Duplicate Finder - Professional UI - Ms.Tissarin Wadphrai")
-        self.resize(1200, 750)
+        self.resize(1250, 750)
         
         self.target_folder = ""
-        self.scan_targets = []  # ลิสต์รองรับหลายพาธ (เพื่อรองรับการสแกนทุกไดรฟ์ + OneDrive พร้อมกัน)
+        self.scan_targets = []
         self.scanner_thread = None
         self.delete_thread = None
-        self.observer = None  # สถานะเฝ้าระวังไฟล์ Real-time
+        self.observer = None
         self.history_file = "delete_history.json"
         self.backup_dir = os.path.abspath(".trash_backup")
         self.db = DatabaseManager()
         self.is_dark_mode = True
         self.scan_start_time = None
         self.last_total_scanned = 0
+        self.last_total_all_files = 0
+        self.last_skipped_system_files = 0
 
         if not os.path.exists(self.backup_dir):
             os.makedirs(self.backup_dir, exist_ok=True)
@@ -293,29 +291,31 @@ class DuplicateCleanerUI(QMainWindow):
         
         free_gb = self.get_free_space_gb()
         self.lbl_card_free = QLabel(f"💾 พื้นที่คงเหลือ: {free_gb:.2f} GB")
-        self.lbl_card_time = QLabel("⏳ เหลือเวลาอีกประมาณ: -")
-        self.lbl_card_total_dup = QLabel("📊 ไฟล์ซ้ำทั้งหมด: 0 / 0 ไฟล์")
-        self.lbl_card_deletable = QLabel("🗑️ ไฟล์ที่สามารถลบได้: 0 ไฟล์")
-        self.lbl_card_save = QLabel("♻️ พื้นที่ประหยัดได้: 0.00 B")
+        self.lbl_card_time = QLabel("⏳ เหลือเวลา: -")
+        self.lbl_card_all_files = QLabel("🗂️ ไฟล์ทั้งหมด: 0 (ข้ามระบบ 0)")
+        self.lbl_card_total_dup = QLabel("📊 ไฟล์ซ้ำ: 0 / 0 ไฟล์")
+        self.lbl_card_deletable = QLabel("🗑️ ลบได้: 0 ไฟล์")
+        self.lbl_card_save = QLabel("♻️ ประหยัดได้: 0.00 B")
         self.lbl_card_status = QLabel("⌛ พร้อมทำงาน")
 
         self.card_labels = [
             self.lbl_card_free, self.lbl_card_time, 
-            self.lbl_card_total_dup, self.lbl_card_deletable,
-            self.lbl_card_save, self.lbl_card_status
+            self.lbl_card_all_files, self.lbl_card_total_dup, 
+            self.lbl_card_deletable, self.lbl_card_save, self.lbl_card_status
         ]
         for card in self.card_labels:
-            card.setStyleSheet("font-size: 13px; font-weight: 500;")
+            card.setStyleSheet("font-size: 12.5px; font-weight: 500;")
             cards_layout.addWidget(card)
 
         main_layout.addLayout(cards_layout)
 
-        # Status Line & Progress Bar
+        # Status Line & Progress Bar (โหมดเปอร์เซ็นต์ 0% - 100%)
         self.lbl_status_line = QLabel("พร้อมสแกนข้อมูล")
         self.lbl_status_line.setStyleSheet("font-size: 12px;")
         main_layout.addWidget(self.lbl_status_line)
 
         self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("%p%")
         main_layout.addWidget(self.progress_bar)
@@ -683,7 +683,6 @@ class DuplicateCleanerUI(QMainWindow):
             QMessageBox.warning(self, "แจ้งเตือน", "กรุณาเลือกโฟลเดอร์หรือสแกนทั้งระบบก่อน")
             return
 
-        # ปิดระบบ Watcher เก่าชั่วคราวระหว่างทำการสแกนเต็มรูปแบบ เพื่อให้ความเร็วสูงสุด
         if self.observer:
             try:
                 self.observer.stop()
@@ -704,44 +703,55 @@ class DuplicateCleanerUI(QMainWindow):
         self.btn_select.setEnabled(False)
         self.btn_scan_c.setEnabled(False)
         self.btn_delete.setEnabled(False)
+
+        # ตั้งค่าหลอดเขียวเป็นโหมดเปอร์เซ็นต์ 0% - 100% ตั้งแต่เริ่มต้น
+        self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("%p%")
+
         self.lbl_card_status.setText("⌛ กำลังสแกน...")
-        self.lbl_card_total_dup.setText("📊 ไฟล์ซ้ำทั้งหมด: 0 / 0 ไฟล์")
-        self.lbl_card_deletable.setText("🗑️ ไฟล์ที่สามารถลบได้: 0 ไฟล์")
-        self.lbl_card_time.setText("⏳ เหลือเวลาอีกประมาณ: คำนวณ...")
+        self.lbl_card_all_files.setText("🗂️ ไฟล์ทั้งหมด: กำลังนับ...")
+        self.lbl_card_total_dup.setText("📊 ไฟล์ซ้ำ: 0 / 0 ไฟล์")
+        self.lbl_card_deletable.setText("🗑️ ลบได้: 0 ไฟล์")
+        self.lbl_card_time.setText("⏳ เหลือเวลา: คำนวณ...")
 
         self.scan_start_time = time.time()
         self.last_total_scanned = 0
+        self.last_total_all_files = 0
+        self.last_skipped_system_files = 0
 
-        self.scanner_thread = ScannerThread(self.target_folder)
+        self.scanner_thread = ScannerThread(self.scan_targets)
         self.scanner_thread.progress_signal.connect(self.update_status_signal)
         self.scanner_thread.progress_percent.connect(self.update_progress)
         self.scanner_thread.time_signal.connect(self.update_time)
+        self.scanner_thread.stats_signal.connect(self.update_file_stats)
         self.scanner_thread.finished_signal.connect(self.display_results)
         self.scanner_thread.start()
 
     def update_status_signal(self, text):
         self.lbl_status_line.setText(text)
 
+    def update_file_stats(self, total_all, scanned_user, skipped_sys):
+        self.last_total_all_files = total_all
+        self.last_total_scanned = scanned_user
+        self.last_skipped_system_files = skipped_sys
+        self.lbl_card_all_files.setText(f"🗂️ ไฟล์ทั้งหมด: {total_all:,} (ข้ามระบบ {skipped_sys:,})")
+
     def update_progress(self, current, total):
-        self.last_total_scanned = total
         if total > 0:
             val = int((current / total) * 100)
             self.progress_bar.setValue(val)
-            self.progress_bar.setFormat(f"{val}% ({current:,}/{total:,})")
+            self.progress_bar.setFormat(f"{val}%")
 
-            if self.scan_start_time and current > 5:
+            if self.scan_start_time and val >= 3:
                 elapsed = time.time() - self.scan_start_time
-                speed = current / elapsed
-                if speed > 0 and total > current:
-                    remaining_files = total - current
-                    remaining_sec = int(remaining_files / speed)
-                    
+                if val < 100:
+                    remaining_sec = int((elapsed / val) * (100 - val))
                     mins, secs = divmod(remaining_sec, 60)
                     if mins > 0:
-                        self.lbl_card_time.setText(f"⏳ เหลือเวลาอีกประมาณ: {mins} นาที {secs} วิ")
+                        self.lbl_card_time.setText(f"⏳ เหลือเวลา: ~{mins} น. {secs} วิ")
                     else:
-                        self.lbl_card_time.setText(f"⏳ เหลือเวลาอีกประมาณ: {secs} วิ")
+                        self.lbl_card_time.setText(f"⏳ เหลือเวลา: ~{secs} วิ")
 
     def update_time(self, elapsed, eta):
         pass
@@ -764,7 +774,6 @@ class DuplicateCleanerUI(QMainWindow):
 
                 current_pixmap = None
 
-                # 1. ไฟล์รูปภาพ
                 if ext in ['.jpg', '.jpeg', '.png', '.bmp', '.webp', '.gif']:
                     reader = QImageReader(clean_path)
                     reader.setAutoTransform(True)
@@ -782,7 +791,6 @@ class DuplicateCleanerUI(QMainWindow):
                         self.lbl_preview_image.setText("🖼️ ไม่สามารถโหลดตัวอย่างภาพได้")
                         self.lbl_preview_info.setText(info_text)
 
-                # 2. ไฟล์ PDF
                 elif ext == '.pdf':
                     try:
                         import fitz
@@ -810,7 +818,6 @@ class DuplicateCleanerUI(QMainWindow):
                         self.lbl_preview_image.setText(f"📕 ไม่สามารถแปลง PDF เป็นภาพได้:\n{str(e)}")
                         self.lbl_preview_info.setText(info_text)
 
-                # 3. ไฟล์ Word (.docx)
                 elif ext == '.docx':
                     if docx:
                         try:
@@ -828,7 +835,6 @@ class DuplicateCleanerUI(QMainWindow):
                     
                     self.lbl_preview_info.setText(info_text.replace("🔍 (คลิกซ้ายที่รูป preview ด้านบนเพื่อขยายใหญ่)", ""))
                 
-                # 4. ไฟล์ข้อความทั่วไป
                 elif ext in ['.txt', '.csv', '.log', '.json', '.xml', '.py', '.md', '.html', '.ini', '.bat']:
                     try:
                         with open(clean_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -839,7 +845,6 @@ class DuplicateCleanerUI(QMainWindow):
                         self.lbl_preview_image.setText("📄 ไม่สามารถอ่านเนื้อหาไฟล์นี้ได้")
                         self.lbl_preview_info.setText(info_text)
 
-                # 5. ไฟล์ประเภทอื่น
                 else:
                     self.lbl_preview_image.setText(f"📦 ไฟล์ประเภท {ext.upper()}\n(ไม่รองรับการแสดงตัวอย่างเนื้อหา)")
                     self.lbl_preview_info.setText(info_text.replace("🔍 (คลิกซ้ายที่รูป preview ด้านบนเพื่อขยายใหญ่)", ""))
@@ -872,14 +877,22 @@ class DuplicateCleanerUI(QMainWindow):
         self.btn_scan.setEnabled(True)
         self.btn_select.setEnabled(True)
         self.btn_scan_c.setEnabled(True)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(100)
+        self.progress_bar.setFormat("100%")
         
         if self.scan_start_time:
             total_elapsed = int(time.time() - self.scan_start_time)
-            self.lbl_card_time.setText(f"⏱️ สแกนเสร็จใน: {total_elapsed} วิ")
+            mins, secs = divmod(total_elapsed, 60)
+            if mins > 0:
+                self.lbl_card_time.setText(f"⏱️ เสร็จใน: {mins} น. {secs} วิ")
+            else:
+                self.lbl_card_time.setText(f"⏱️ เสร็จใน: {secs} วิ")
 
         total_scanned = self.last_total_scanned
+        total_all = self.last_total_all_files
+        skipped_sys = self.last_skipped_system_files
 
-        # สั่งเริ่มเปิดเฝ้าระวังไฟล์ Real-time "หลังจากสแกนเสร็จแล้วเท่านั้น"
         try:
             if self.target_folder and os.path.exists(self.target_folder):
                 self.observer = start_watching(self.target_folder)
@@ -887,11 +900,13 @@ class DuplicateCleanerUI(QMainWindow):
             print(f"ไม่สามารถเริ่ม Real-time File Watcher ได้: {e}")
 
         if not duplicates:
-            self.lbl_card_status.setText("🎉 ไม่พบรายการซ้ำแล้ว!")
-            self.lbl_status_line.setText("ไม่พบไฟล์ซ้ำในพื้นที่นี้")
-            self.lbl_card_save.setText("♻️ พื้นที่ประหยัดได้: 0.00 B")
-            self.lbl_card_total_dup.setText(f"📊 ไฟล์ซ้ำทั้งหมด: 0 / {total_scanned:,} ไฟล์")
-            self.lbl_card_deletable.setText("🗑️ ไฟล์ที่สามารถลบได้: 0 ไฟล์")
+            self.lbl_card_status.setText("🎉 ไม่พบรายการซ้ำ!")
+            self.lbl_status_line.setText(
+                f"ไม่พบไฟล์ซ้ำ | ไฟล์ในเครื่องทั้งหมด {total_all:,} ไฟล์ (สแกนจริง {total_scanned:,} / ข้ามไฟล์ระบบ {skipped_sys:,})"
+            )
+            self.lbl_card_save.setText("♻️ ประหยัดได้: 0.00 B")
+            self.lbl_card_total_dup.setText(f"📊 ไฟล์ซ้ำ: 0 / {total_scanned:,} ไฟล์")
+            self.lbl_card_deletable.setText("🗑️ ลบได้: 0 ไฟล์")
             self.btn_delete.setEnabled(False)
             self.tree.blockSignals(False)
             QMessageBox.information(self, "ผลการสแกน", "ไม่พบไฟล์ซ้ำในพื้นที่ที่เลือก")
@@ -901,9 +916,11 @@ class DuplicateCleanerUI(QMainWindow):
         total_groups = len(duplicates)
 
         self.lbl_card_status.setText("🎉 สแกนเสร็จแล้ว!")
-        self.lbl_card_total_dup.setText(f"📊 ไฟล์ซ้ำทั้งหมด: {total_duplicate_files:,} / {total_scanned:,} ไฟล์")
-        self.lbl_status_line.setText(f"สแกนเสร็จสิ้น! พบไฟล์ซ้ำ {total_duplicate_files:,} ไฟล์ จากไฟล์ทั้งหมด {total_scanned:,} ไฟล์ (ใน {total_groups:,} กลุ่ม)")
-        self.progress_bar.setValue(100)
+        self.lbl_card_total_dup.setText(f"📊 ไฟล์ซ้ำ: {total_duplicate_files:,} / {total_scanned:,} ไฟล์")
+        self.lbl_status_line.setText(
+            f"สแกนเสร็จสิ้น! พบไฟล์ซ้ำ {total_duplicate_files:,} ไฟล์ (ใน {total_groups:,} กลุ่ม) | "
+            f"ไฟล์ในเครื่องทั้งหมด {total_all:,} ไฟล์ (สแกนจริง {total_scanned:,} / ข้ามไฟล์ระบบ {skipped_sys:,})"
+        )
         self.btn_delete.setEnabled(True)
 
         def group_has_deletable_files(item_tuple):
@@ -974,8 +991,8 @@ class DuplicateCleanerUI(QMainWindow):
                     if size:
                         total_savable_bytes += size
                         
-        self.lbl_card_deletable.setText(f"🗑️ ไฟล์ที่สามารถลบได้: {selected_file_count:,} ไฟล์")
-        self.lbl_card_save.setText(f"♻️ พื้นที่ประหยัดได้: {self.format_size(total_savable_bytes)}")
+        self.lbl_card_deletable.setText(f"🗑️ ลบได้: {selected_file_count:,} ไฟล์")
+        self.lbl_card_save.setText(f"♻️ ประหยัดได้: {self.format_size(total_savable_bytes)}")
 
     def is_protected_file(self, filepath):
         if is_system_path(filepath):
@@ -1083,13 +1100,13 @@ class DuplicateCleanerUI(QMainWindow):
         self.tree.blockSignals(False)
 
         total_scanned = self.last_total_scanned
-        self.lbl_card_total_dup.setText(f"📊 ไฟล์ซ้ำทั้งหมด: {remaining_files_count:,} / {total_scanned:,} ไฟล์")
+        self.lbl_card_total_dup.setText(f"📊 ไฟล์ซ้ำ: {remaining_files_count:,} / {total_scanned:,} ไฟล์")
 
         if root.childCount() == 0:
-            self.lbl_card_status.setText("🎉 ไม่พบรายการซ้ำแล้ว!")
+            self.lbl_card_status.setText("🎉 ไม่พบรายการซ้ำ!")
             self.lbl_status_line.setText("ย้ายไฟล์ซ้ำลง Recycle Bin หมดแล้ว")
-            self.lbl_card_save.setText("♻️ พื้นที่ประหยัดได้: 0.00 B")
-            self.lbl_card_deletable.setText("🗑️ ไฟล์ที่สามารถลบได้: 0 ไฟล์")
+            self.lbl_card_save.setText("♻️ ประหยัดได้: 0.00 B")
+            self.lbl_card_deletable.setText("🗑️ ลบได้: 0 ไฟล์")
             self.btn_delete.setEnabled(False)
         else:
             self.update_savable_space()
@@ -1171,7 +1188,7 @@ class DuplicateCleanerUI(QMainWindow):
                 f"กู้คืนไฟล์เรียบร้อยแล้วจำนวน {restored_count:,} รายการ\n(และทำการล้างไฟล์ขยะใน Recycle Bin ให้เรียบร้อยแล้ว)"
             )
 
-            if self.target_folder:
+            if self.scan_targets:
                 self.start_scan()
 
         except Exception as e:
